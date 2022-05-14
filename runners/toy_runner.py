@@ -1,6 +1,7 @@
 import logging
 import torch.optim as optim
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.distributions import Normal
 from losses.sliced_sm import *
 from losses.dsm import *
@@ -8,6 +9,7 @@ from models.gmm import GMM, Gaussian, GMMDist, Square, GMMDistAnneal
 import matplotlib.pyplot as plt
 import torch
 import seaborn as sns
+from losses.kl_divergence import kl_divergence
 sns.set()
 sns.set_style('white')
 
@@ -65,7 +67,7 @@ class ToyRunner():
     def anneal_langevin_dynamics(score, init, sigmas, lr=0.1, n_steps_each=100):
         for sigma in sigmas:
             for i in range(n_steps_each):
-                current_lr = lr * (sigma / sigmas[-1]) ** 2
+                current_lr = lr * (sigma) ** 2
                 init = init + current_lr / 2 * score(init, sigma).detach()
                 init = init + torch.randn_like(init) * np.sqrt(current_lr)
 
@@ -87,11 +89,15 @@ class ToyRunner():
         plt.title("Data Density")
         plt.show()
 
-    def visualize_doublewell(self, data, model, left_bound=-1., right_bound=1., savefig=None, step=None, device=None):
+    def visualize_doublewell(self, data, model, left_bound=-1., right_bound=1., savefig=None, step=None, device=None, sigmas=None):
+        print("!", type(data))
         self.plot_energy(self.energy, extent=(left_bound, right_bound))
         plt.scatter(data[:, 0], data[:, 1], s=0.1)
         plt.title("Sampled Data")
+        plt.xlim([left_bound, right_bound])
+        plt.ylim([left_bound, right_bound])
         plt.show()
+
         grid_size = 20
         mesh = []
         x = np.linspace(left_bound, right_bound, grid_size)
@@ -105,19 +111,24 @@ class ToyRunner():
         if device is not None:
             mesh = mesh.to(device)
 
-        scores = model(mesh.detach())
+        scores = model(mesh.detach(), sigmas=sigmas[-1])
         mesh = mesh.detach().numpy()
         scores = scores.detach().numpy()
 
         plt.grid(False)
         plt.axis('off')
         plt.quiver(mesh[:, 0], mesh[:, 1], scores[:, 0], scores[:, 1], width=0.005)
+        plt.scatter(data[:, 0], data[:, 1], s=0.1)
         plt.title('Estimated scores', fontsize=16)
         plt.axis('square')
+        x = np.linspace(left_bound, right_bound, grid_size)
+        y = np.linspace(left_bound, right_bound, grid_size)
         plt.show()
 
-        samples = torch.rand(5000, 2) * (right_bound - left_bound) + left_bound
-        samples = ToyRunner.langevin_dynamics(model, samples).detach().numpy()
+        samples = torch.rand(10000, 2) * (right_bound - left_bound) + left_bound
+        #samples = ToyRunner.langevin_dynamics(model, samples).detach().numpy()
+        samples = ToyRunner.anneal_langevin_dynamics(model, samples, sigmas, lr=5e-2).detach().numpy()
+        print("KL divergence:", kl_divergence(data, samples))
         plt.scatter(samples[:, 0], samples[:, 1], s=0.1)
         plt.axis('square')
         plt.title('Generated Data')
@@ -325,46 +336,51 @@ class ToyRunner():
         init_state = torch.Tensor([[-2, 0], [2, 0]])
         init_state = torch.cat([init_state, torch.Tensor(init_state.shape[0], dim-2).normal_()], dim=-1)
         target_sampler = GaussianMCMCSampler(target, init_state=init_state)
-        data = target_sampler.sample(num_samples)
+        data = target_sampler.sample(50000)
 
         hidden_units = 128
-        score = nn.Sequential(
-            nn.Linear(2, hidden_units),
-            nn.Softplus(),
-            nn.Linear(hidden_units, hidden_units),
-            nn.Softplus(),
-            nn.Linear(hidden_units, 2),
-        )
+        # score = nn.Sequential(
+        #     nn.Linear(2, hidden_units),
+        #     nn.Softplus(),
+        #     nn.Linear(hidden_units, hidden_units),
+        #     nn.Softplus(),
+        #     nn.Linear(hidden_units, 2),
+        # )
+
+        sigma_start = 1
+        sigma_end   = 1e-2
+        n_sigmas = 10
+        sigmas = torch.Tensor(np.exp(np.linspace(np.log(sigma_start), np.log(sigma_end), n_sigmas)))
+
+        score = ScoreNet(sigmas, hidden_units)
 
         batch_size = 128
         idx = np.arange(num_samples)
         np.random.shuffle(idx)
 
         train_x = data[idx]
-        test_x = data[idx]
         trainset = MoleculeSet(train_x)
         trainloader = torch.utils.data.DataLoader(trainset, batch_size=batch_size, shuffle=True)
 
         optimizer = optim.Adam(score.parameters(), lr=1e-4)
-        sigma_start = 1
-        sigma_end   = 1e-2
-        n_sigmas = 10
-        sigmas = np.exp(np.linspace(np.log(sigma_start), np.log(sigma_end), n_sigmas))
+        
 
-        for epoch in range(512):
+        for epoch in range(32):
             running_loss = 0
             for i, batch in enumerate(trainloader):
                 optimizer.zero_grad()
 
                 # loss, *_ = sliced_score_estimation_vr(score, batch, n_particles=1)
                 # loss = dsm_score_estimation(score, batch, sigma=1e-1)
+                labels = torch.randint(low=0, high = n_sigmas-1, size = [batch.shape[0]])
+                loss = anneal_dsm_score_estimation(score, batch, labels, sigmas)
 
                 loss.backward()
                 optimizer.step()
                 running_loss += loss.item()
             print("Epoch: {}, Total Loss: {}".format(epoch, running_loss))
 
-        self.visualize_doublewell(data, score, left_bound=-3.5, right_bound=3.5)
+        self.visualize_doublewell(train_x, score, left_bound=-3.5, right_bound=3.5, sigmas=sigmas)
 
 
     def annealed_sampling_exp(self, left_bound=-8, right_bound=8):
@@ -441,8 +457,25 @@ class ToyRunner():
             plt.show()
 
 class ScoreNet(nn.Module):
-    def __init__(self, sigmas):
+    def __init__(self, sigmas, H=128):
         super().__init__()
         self.sigmas = sigmas
-        
+        self.fc1 = nn.Linear(2, H)
+        self.fc2 = nn.Linear(H, H)
+        self.fc3 = nn.Linear(H, H)
+        self.fc4 = nn.Linear(H, 2)
+
+    def forward(self, x, sigmas):
+
+        y = F.relu(self.fc1(x))
+        y = F.relu(self.fc2(y))
+        y = F.relu(self.fc3(y))
+        y = self.fc4(y) / sigmas.expand(x.shape)
+
+        return y
+
+
+
+
+
 
