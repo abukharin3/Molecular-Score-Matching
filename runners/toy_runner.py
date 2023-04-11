@@ -32,34 +32,21 @@ class MoleculeSet(torch.utils.data.Dataset):
         return self.molecules[idx]
 
 
-class Ring():
-    def __init__(self, radius, width):
-        self.radius = radius
-        self.width = width
-        self.r_dist = Normal(loc=radius, scale=width)
-
-    def sample(self, sample_shape):
-        theta = torch.rand(sample_shape) * np.pi * 2
-        r = self.r_dist.sample(sample_shape)
-        x = r * torch.cos(theta)
-        y = r * torch.sin(theta)
-        return torch.stack([x, y], dim=-1)
-
-    def log_prob(self, inputs):
-        r = torch.norm(inputs, dim=-1)
-        return self.r_dist.log_prob(r) - torch.log(r * np.pi * 2)
-
-
 class ToyRunner():
     def __init__(self, args, config):
         self.args = args
         self.config = config
 
     @staticmethod
-    def langevin_dynamics(score, init, lr=0.1, step=100):
+    def langevin_dynamics(score, init, lr=0.1, step=100, force=True):
         for i in range(step):
             current_lr = lr
-            init = init + current_lr / 2 * score(init).detach()
+            if force:
+                target = DoubleWellEnergy(2, c=0.5)
+                print("Force")
+                init = init + current_lr / 2 * target.force(init).detach()
+            else:
+                init = init + current_lr / 2 * score(init).detach()
             init = init + torch.randn_like(init) * np.sqrt(current_lr)
         return init
 
@@ -89,7 +76,7 @@ class ToyRunner():
         plt.title("Data Density")
         plt.show()
 
-    def visualize_doublewell(self, data, model, left_bound=-1., right_bound=1., savefig=None, step=None, device=None, sigmas=None):
+    def visualize_doublewell(self, data, smodel, fmodel, left_bound=-1., right_bound=1., savefig=None, step=None, device=None, sigmas=None, force=True, score_and_force=False):
         print("!", type(data))
         self.plot_energy(self.energy, extent=(left_bound, right_bound))
         plt.scatter(data[:, 0], data[:, 1], s=0.1)
@@ -111,30 +98,92 @@ class ToyRunner():
         if device is not None:
             mesh = mesh.to(device)
 
-        scores = model(mesh.detach(), sigmas=sigmas[-1])
-        mesh = mesh.detach().numpy()
-        scores = scores.detach().numpy()
+        if not score_and_force:
+            if force:
+                scores = fmodel(mesh.detach())
+            else:
+                scores = smodel(mesh.detach(), sigmas=sigmas[-1])
+            mesh = mesh.detach().numpy()
+            scores = scores.detach().numpy()
 
-        plt.grid(False)
-        plt.axis('off')
-        plt.quiver(mesh[:, 0], mesh[:, 1], scores[:, 0], scores[:, 1], width=0.005)
-        plt.scatter(data[:, 0], data[:, 1], s=0.1)
-        plt.title('Estimated scores', fontsize=16)
-        plt.axis('square')
-        x = np.linspace(left_bound, right_bound, grid_size)
-        y = np.linspace(left_bound, right_bound, grid_size)
-        plt.show()
+            plt.grid(False)
+            plt.axis('off')
+            plt.quiver(mesh[:, 0], mesh[:, 1], scores[:, 0], scores[:, 1], width=0.005)
+            plt.scatter(data[:, 0], data[:, 1], s=0.1)
+            plt.title('Estimated scores', fontsize=16)
+            plt.axis('square')
+            x = np.linspace(left_bound, right_bound, grid_size)
+            y = np.linspace(left_bound, right_bound, grid_size)
+            plt.show()
+            torch.manual_seed(0)
+            samples = torch.rand(10000, 2) * (right_bound - left_bound) + left_bound
+            if force:
+                samples = ToyRunner.langevin_dynamics(fmodel, samples, lr=5e-2, force=False).detach().numpy()
+            else:
+                samples = ToyRunner.anneal_langevin_dynamics(smodel, samples, sigmas, lr=5e-2).detach().numpy()
 
-        samples = torch.rand(10000, 2) * (right_bound - left_bound) + left_bound
-        #samples = ToyRunner.langevin_dynamics(model, samples).detach().numpy()
-        samples = ToyRunner.anneal_langevin_dynamics(model, samples, sigmas, lr=5e-2).detach().numpy()
-        print("KL divergence:", kl_divergence(data, samples))
-        plt.scatter(samples[:, 0], samples[:, 1], s=0.1)
-        plt.axis('square')
-        plt.title('Generated Data')
-        plt.xlim([left_bound, right_bound])
-        plt.ylim([left_bound, right_bound])
-        plt.show()
+            dim = 2
+            target = DoubleWellEnergy(dim, c=0.5)
+            self.energy = target
+            np.random.seed(0)
+            torch.manual_seed(0)
+            init_state = torch.Tensor([[-2, 0], [2, 0]])
+            init_state = torch.cat([init_state, torch.Tensor(init_state.shape[0], dim - 2).normal_()], dim=-1)
+            target_sampler = GaussianMCMCSampler(target, init_state=init_state)
+            data = target_sampler.sample(10000)
+
+            print("KL divergence:", kl_divergence(data, samples))
+            plt.scatter(samples[:, 0], samples[:, 1], s=0.1)
+            plt.axis('square')
+            plt.title('Generated Data')
+            plt.xlim([left_bound, right_bound])
+            plt.ylim([left_bound, right_bound])
+            plt.show()
+
+        else:
+            force_scores = fmodel(mesh.detach())
+            sm_scores = smodel(mesh.detach(), sigmas=sigmas[-1])
+
+            mesh = mesh.detach().numpy()
+            force_scores = force_scores.detach().numpy()
+            sm_scores = sm_scores.detach().numpy()
+
+            plt.grid(False)
+            plt.axis('off')
+            plt.quiver(mesh[:, 0], mesh[:, 1], sm_scores[:, 0], sm_scores[:, 1], width=0.005, color='red', label="Score Match Scores")
+            plt.quiver(mesh[:, 0], mesh[:, 1], force_scores[:, 0], force_scores[:, 1], width=0.005, color='blue', label="Force Match Scores")
+            plt.legend(bbox_to_anchor=(1.0, 0.05))
+            plt.scatter(data[:, 0], data[:, 1], s=0.1)
+            plt.title('Estimated scores', fontsize=16)
+            plt.axis('square')
+            x = np.linspace(left_bound, right_bound, grid_size)
+            y = np.linspace(left_bound, right_bound, grid_size)
+            plt.show()
+
+            torch.manual_seed(0)
+            samples = torch.rand(10000, 2) * (right_bound - left_bound) + left_bound
+
+            samples = ToyRunner.anneal_langevin_dynamics(smodel, samples, sigmas[:], lr=5e-2, n_steps_each=75).detach()
+            samples = ToyRunner.langevin_dynamics(fmodel, samples, lr=5e-2, force=False, step=25).detach().numpy()
+
+            plt.scatter(samples[:, 0], samples[:, 1], s=0.1)
+            plt.axis('square')
+            plt.title('Generated Data')
+            plt.xlim([left_bound, right_bound])
+            plt.ylim([left_bound, right_bound])
+            plt.show()
+
+            dim = 2
+            target = DoubleWellEnergy(dim, c=0.5)
+            self.energy = target
+            np.random.seed(0)
+            torch.manual_seed(0)
+            init_state = torch.Tensor([[-2, 0], [2, 0]])
+            init_state = torch.cat([init_state, torch.Tensor(init_state.shape[0], dim - 2).normal_()], dim=-1)
+            target_sampler = GaussianMCMCSampler(target, init_state=init_state)
+            data = target_sampler.sample(10000)
+            print(data.shape, samples.shape)
+            print("KL divergence:", kl_divergence(data, samples))
 
 
     @staticmethod
@@ -268,51 +317,8 @@ class ToyRunner():
         plt.scatter(noise[:, 0], noise[:, 1])
         plt.show()
 
-    def fisher_information(self, energy_net, data, teacher):
-        data.requires_grad_(True)
-        log_pdf_model = -energy_net(data)
-        model_score = autograd.grad(log_pdf_model.sum(), data)[0]
-        log_pdf_actual = teacher.log_prob(data)
-        actual_score = autograd.grad(log_pdf_actual.sum(), data)[0]
-        return 1 / 2 * ((model_score - actual_score) ** 2).sum(1).mean(0)
-
-    def train(self):
-        hidden_units = 128
-        score = nn.Sequential(
-            nn.Linear(2, hidden_units),
-            nn.Softplus(),
-            nn.Linear(hidden_units, hidden_units),
-            nn.Softplus(),
-            nn.Linear(hidden_units, 2),
-        )
-
-        teacher = GMMDist(dim=2)
-        optimizer = optim.Adam(score.parameters(), lr=0.001)
 
 
-        sigma_begin = 1e-2
-        sigma_end = 1
-        num = 20
-        sigmas = torch.tensor(
-            np.exp(np.linspace(np.log(sigma_begin), np.log(sigma_end),
-                               num))).float()
-
-        for step in range(10000):
-            samples = teacher.sample((128,))
-            labels = torch.randint(0, len(sigmas), (samples.shape[0],))
-
-            # loss, *_ = sliced_score_estimation_vr(score, samples, n_particles=1)
-            # loss, *_ = sliced_score_estimation(score, samples, n_particles=10)
-            loss = anneal_sliced_score_estimation_vr(score, samples, labels, sigmas, n_particles=1)
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            #logging.info('step: {}, loss: {}'.format(step, loss.item()))
-            if step % 1000 == 0:
-                print(step, loss.item())
-        self.visualize(teacher, score, -8, 8, savefig=None)
 
     def plot_samples(self, samples, weights=None, range=None):
         """ Plot sample histogram in 2D """
@@ -327,25 +333,26 @@ class ToyRunner():
         )
         plt.show()
 
-    def train_doublewell(self, loss = "vr", num_samples=10000):
+    def train_doublewell(self, loss = "vr", num_samples=10000, train_force=False, score_and_force=True):
         # Set up double well
         dim=2
         target = DoubleWellEnergy(dim, c=0.5)
         self.energy = target
-
+        np.random.seed(0)
+        torch.manual_seed(0)
         init_state = torch.Tensor([[-2, 0], [2, 0]])
         init_state = torch.cat([init_state, torch.Tensor(init_state.shape[0], dim-2).normal_()], dim=-1)
         target_sampler = GaussianMCMCSampler(target, init_state=init_state)
-        data = target_sampler.sample(50000)
+        data = target_sampler.sample(num_samples)
 
         hidden_units = 128
-        # score = nn.Sequential(
-        #     nn.Linear(2, hidden_units),
-        #     nn.Softplus(),
-        #     nn.Linear(hidden_units, hidden_units),
-        #     nn.Softplus(),
-        #     nn.Linear(hidden_units, 2),
-        # )
+        force = nn.Sequential(
+            nn.Linear(2, hidden_units),
+            nn.Softplus(),
+            nn.Linear(hidden_units, hidden_units),
+            nn.Softplus(),
+            nn.Linear(hidden_units, 2),
+        )
 
         sigma_start = 1
         sigma_end   = 1e-2
@@ -362,25 +369,71 @@ class ToyRunner():
         trainset = MoleculeSet(train_x)
         trainloader = torch.utils.data.DataLoader(trainset, batch_size=batch_size, shuffle=True)
 
-        optimizer = optim.Adam(score.parameters(), lr=1e-4)
-        
+        force_optimizer = optim.Adam(force.parameters(), lr=1e-3)
+        optimizer = optim.Adam(score.parameters(), lr=1e-3)
+        if train_force:
+            for epoch in range(100000 // num_samples):
+                running_loss = 0
+                for i, batch in enumerate(trainloader):
+                    force_optimizer.zero_grad()
 
-        for epoch in range(32):
-            running_loss = 0
-            for i, batch in enumerate(trainloader):
-                optimizer.zero_grad()
+                    labels = target.force(batch).detach()
+                    loss = torch.linalg.norm(labels - force(batch), ord=2)
 
-                # loss, *_ = sliced_score_estimation_vr(score, batch, n_particles=1)
-                # loss = dsm_score_estimation(score, batch, sigma=1e-1)
-                labels = torch.randint(low=0, high = n_sigmas-1, size = [batch.shape[0]])
-                loss = anneal_dsm_score_estimation(score, batch, labels, sigmas)
+                    loss.backward()
+                    force_optimizer.step()
+                    running_loss += loss.item()
+                print("Epoch: {}, Total Loss: {}".format(epoch, running_loss))
+            self.visualize_doublewell(train_x, None, force, left_bound=-6.5, right_bound=6.5, sigmas=sigmas, force=True)
 
-                loss.backward()
-                optimizer.step()
-                running_loss += loss.item()
-            print("Epoch: {}, Total Loss: {}".format(epoch, running_loss))
+        elif score_and_force:
+            for epoch in range(100000 // num_samples):
+                running_loss = 0
+                for i, batch in enumerate(trainloader):
+                    force_optimizer.zero_grad()
 
-        self.visualize_doublewell(train_x, score, left_bound=-3.5, right_bound=3.5, sigmas=sigmas)
+                    labels = target.force(batch).detach()
+                    loss = torch.linalg.norm(labels - force(batch), ord=2)
+
+                    loss.backward()
+                    force_optimizer.step()
+                    running_loss += loss.item()
+                print("Epoch: {}, Total Loss: {}".format(epoch, running_loss))
+
+            for epoch in range(320):
+                running_loss = 0
+                for i, batch in enumerate(trainloader):
+                    optimizer.zero_grad()
+
+                    # loss, *_ = sliced_score_estimation_vr(score, batch, n_particles=1)
+                    # loss = dsm_score_estimation(score, batch, sigma=1e-1)
+                    labels = torch.randint(low=0, high = n_sigmas-1, size = [batch.shape[0]])
+                    loss = anneal_dsm_score_estimation(score, batch, labels, sigmas)
+
+                    loss.backward()
+                    optimizer.step()
+                    running_loss += loss.item()
+                print("Epoch: {}, Total Loss: {}".format(epoch, running_loss))
+
+            self.visualize_doublewell(train_x, score, force, left_bound=-6.5, right_bound=6.5, sigmas=sigmas, force=False, score_and_force=True)
+
+        else:
+            for epoch in range(320):
+                running_loss = 0
+                for i, batch in enumerate(trainloader):
+                    optimizer.zero_grad()
+
+                    # loss, *_ = sliced_score_estimation_vr(score, batch, n_particles=1)
+                    # loss = dsm_score_estimation(score, batch, sigma=1e-1)
+                    labels = torch.randint(low=0, high = n_sigmas-1, size = [batch.shape[0]])
+                    loss = anneal_dsm_score_estimation(score, batch, labels, sigmas)
+
+                    loss.backward()
+                    optimizer.step()
+                    running_loss += loss.item()
+                print("Epoch: {}, Total Loss: {}".format(epoch, running_loss))
+
+            self.visualize_doublewell(train_x, score, None, left_bound=-6.5, right_bound=6.5, sigmas=sigmas, force=False)
 
 
     def annealed_sampling_exp(self, left_bound=-8, right_bound=8):
