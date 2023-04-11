@@ -12,3 +12,5 @@ graph_data
 preprocessing/*.csv
 preprocessing/*.txt
 preprocessing/*.data
+results/
+data/

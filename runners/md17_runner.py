@@ -13,14 +13,40 @@ from losses.kl_divergence import kl_divergence
 sns.set()
 sns.set_style('white')
 
-from bgflow import DoubleWellEnergy
-from bgflow import GaussianMCMCSampler
-from bgflow.utils.types import assert_numpy
-import matplotlib as mpl
+from torch_geometric.data import Data, Batch
+from torch_geometric.loader import DataLoader
+from torch_geometric.nn import global_mean_pool, global_add_pool
+
+from models.force_nets import EnergyForceGraphAttention
+from models.score_nets import GraphConvolutionScoreNet
 
 import os
 
-__all__ = ['ToyRunner']
+__all__ = ['BenzeneRunner']
+
+
+def get_distance_matrix(positions):
+    '''
+    Given the positions of atoms in a structure, compute shortest
+    pairwise distances between each atom.
+    
+    Parameters
+    ----------
+    - positions : N x 3 array containining 3D position of N atoms
+        
+    Returns
+    -------
+    - distance_matrix : N x N array of shortest pairwise distances between
+        atoms in a structure
+    '''
+    distance_matrix = np.zeros((positions.shape[0],positions.shape[0]))
+    # iterate through all pairs of atoms only once per pair
+    for i in range(positions.shape[0]):
+        for j in range(i+1, positions.shape[0]):
+            distance_matrix[i,j] = ((positions[i] - positions[j])**2).sum()**(0.5)
+            distance_matrix[j,i] = distance_matrix[i,j]
+                
+    return distance_matrix
 
 
 class MoleculeSet(torch.utils.data.Dataset):
@@ -34,14 +60,11 @@ class MoleculeSet(torch.utils.data.Dataset):
         return self.molecules[idx]
 
 
-class ToyRunner():
-    def __init__(self, n_epochs_score, n_epochs_force, rho=0.01, num_generated_samples=10000, hidden_units_score=128, hidden_units_force=128):
+class BenzeneRunner():
+    def __init__(self, n_epochs_score, n_epochs_force, rho=0.01, num_generated_samples=10000):
 
         self.n_epochs_score = n_epochs_score
         self.n_epochs_force = n_epochs_force
-        
-        self.hidden_units_score = hidden_units_score
-        self.hidden_units_force = hidden_units_force
         
         self.rho = rho
         self.num_generated_samples = num_generated_samples
@@ -246,71 +269,97 @@ class ToyRunner():
 
 
 
-    def train_doublewell(self, num_samples=1000, conservative_force=True, train_force=False, score_and_force=True, savepath=None):
-        # Set up double well
-        dim=2
-        target = DoubleWellEnergy(dim, c=0.5)
-        self.energy = target
-
+    def train_benzene(self, num_molecules, train_force=False, score_and_force=True, savepath=None):
+        
         np.random.seed(0)
         torch.manual_seed(0)
-        init_state = torch.Tensor([[-2, 0], [2, 0]])
-        init_state = torch.cat([init_state, torch.Tensor(init_state.shape[0], dim-2).normal_()], dim=-1)
-        target_sampler = GaussianMCMCSampler(target, init_state=init_state)
-        data = target_sampler.sample(num_samples)
 
-        if conservative_force:
-            force_net = EnergyForceNet(self.hidden_units_force)
-        else:
-            force_net = ForceNet(self.hidden_units_force)
+        md_benzene = np.load("data/md17_benzene2017.npz")
+
+        data_energies = md_benzene['E']
+        data_forces = md_benzene['F']
+        data_positions = md_benzene['R']
+        data_species = md_benzene['z']
+
+        benzene_graphs = []
+        for i in range(num_molecules):
+            
+            dist_mat = get_distance_matrix(data_positions[i])
+            
+            edge_i, edge_j = (dist_mat * (dist_mat < 5.).astype(int)).nonzero()
+            edges = np.concatenate([edge_i.reshape(-1,1), edge_j.reshape(-1,1)], axis=1)
+            
+            benzene_graphs.append(Data(x=torch.Tensor(data_species).unsqueeze(-1),
+                                       edge_index=torch.tensor(edges, dtype=torch.long).t(),
+                                       y=torch.tensor([data_energies[i]]),
+                                       pos=torch.Tensor(data_positions[i]),
+                                       F=torch.tensor(data_forces[i])))
+
+        benzene_graphs_train = DataLoader(benzene_graphs[:int(len(benzene_graphs)*0.6)], batch_size=100, shuffle=True)
+        benzene_graphs_val = DataLoader(benzene_graphs[int(len(benzene_graphs)*0.6):int(len(benzene_graphs)*0.8)], batch_size=100, shuffle=False)
+        benzene_graphs_test = DataLoader(benzene_graphs[int(len(benzene_graphs)*0.8):], batch_size=100, shuffle=False)
+
+
+        force_net = EnergyForceGraphAttention(smear_stop=5., smear_num_gaussians=50)
+
 
         sigma_start = 1
         sigma_end   = 1e-2
         n_sigmas = 10
         sigmas = torch.Tensor(np.exp(np.linspace(np.log(sigma_start), np.log(sigma_end), n_sigmas)))
 
-        score_net = ScoreNet(sigmas, self.hidden_units_score)
+        score_net = GraphConvolutionScoreNet(num_atoms=12)
 
-        idx = np.arange(num_samples)
-        np.random.shuffle(idx)
-
-        train_x = data[idx]
-        trainset = MoleculeSet(train_x)
-        trainloader = torch.utils.data.DataLoader(trainset, batch_size=128, shuffle=True)
 
         rho = self.rho
         force_optimizer = optim.Adam(force_net.parameters(), lr=1e-3)
         score_optimizer = optim.Adam(score_net.parameters(), lr=1e-3)
         if train_force:
-            epoch_losses_force = []
+            training_losses_force = []
+            validation_losses_force = []
             for epoch in range(self.n_epochs_force):
+
+                force_net.train()
                 running_loss = 0
-                for i, batch in enumerate(trainloader):
+                for train_batch in benzene_graphs_train:
                     force_optimizer.zero_grad()
 
-                    force_labels = target.force(batch).detach()
-                    energy_labels = target.force(batch).detach()
+                    energies_pred, forces_pred = force_net(train_batch)
 
-                    energies_pred, forces_pred = force_net(batch)
-                    
-                    if conservative_force:
-                        loss_E = torch.nn.MSELoss()(energies_pred, energy_labels)
-                        loss_F = torch.nn.MSELoss()(forces_pred, force_labels)
+                    loss_E = torch.nn.L1Loss(reduction='mean')(energies_pred.unsqueeze(-1), train_batch.y)
+                    loss_F = torch.nn.L1Loss(reduction='sum')(forces_pred, train_batch.F) / train_batch.num_graphs
 
-                        loss = (rho*loss_E) + loss_F
-
-                    else:
-                        loss = torch.nn.MSELoss()(forces_pred, force_labels)
+                    loss = (rho*loss_E) + loss_F
 
                     loss.backward()
                     force_optimizer.step()
-                    running_loss += loss.item()
-                print("Epoch: {}, Total Loss: {}".format(epoch, running_loss))
-                epoch_losses_force.append(running_loss)
+                    
+                    running_loss += loss.detach().item()*train_batch.num_graphs
+                training_losses_force.append(running_loss)
 
-            plt.plot(epoch_losses_force)
+                force_net.eval()
+                val_running_loss = 0
+                for valid_batch in benzene_graphs_val:
+                    
+                    energies_pred, forces_pred = force_net(valid_batch)
+                    
+                    loss_E = torch.nn.L1Loss(reduction='mean')(energies_pred.unsqueeze(-1), valid_batch.y)
+                    loss_F = torch.nn.L1Loss(reduction='sum')(forces_pred, valid_batch.F) / valid_batch.num_graphs
+
+                    loss = (rho*loss_E) + loss_F
+                    
+                    val_running_loss += loss.item()*valid_batch.num_graphs
+                validation_losses_force.append(val_running_loss)
+
+                if (epoch+1) % 5 == 0:
+                    print("Epoch {} | Train Loss {:.2e} | Validation Loss {:.2e}".format(epoch+1, training_losses_force[-1], validation_losses_force[-1]))
+
+            fig = plt.figure(figsize=(5,2))
+            plt.plot(training_losses_force, label="Training Loss")
+            plt.plot(validation_losses_force, label="Validation Loss")
             plt.xlabel('Training Epoch')
-            plt.ylabel('Training Loss (Force Matching)')
+            plt.ylabel('Loss (Force Matching)')
+            plt.legend()
             if savepath is not None:
                 plt.savefig(savepath + "/force_training_loss.png")
                 plt.clf()
@@ -319,38 +368,54 @@ class ToyRunner():
                 plt.show()
 
 
-            self.visualize_doublewell(train_x, None, force_net, left_bound=-6.5, right_bound=6.5, sigmas=sigmas, force=True, savepath=savepath)
+            # self.visualize_doublewell(train_x, None, force_net, left_bound=-6.5, right_bound=6.5, sigmas=sigmas, force=True, savepath=savepath)
 
         elif score_and_force:
-            epoch_losses_force = []
+            training_losses_force = []
+            validation_losses_force = []
             for epoch in range(self.n_epochs_force):
+
+                force_net.train()
                 running_loss = 0
-                for i, batch in enumerate(trainloader):
+                for train_batch in benzene_graphs_train:
                     force_optimizer.zero_grad()
 
-                    force_labels = target.force(batch).detach()
-                    energy_labels = target.force(batch).detach()
+                    energies_pred, forces_pred = force_net(train_batch)
 
-                    energies_pred, forces_pred = force_net(batch)
-                    
-                    if conservative_force:
-                        loss_E = torch.nn.MSELoss()(energies_pred, energy_labels)
-                        loss_F = torch.nn.MSELoss()(forces_pred, force_labels)
+                    loss_E = torch.nn.L1Loss(reduction='mean')(energies_pred.unsqueeze(-1), train_batch.y)
+                    loss_F = torch.nn.L1Loss(reduction='sum')(forces_pred, train_batch.F) / train_batch.num_graphs
 
-                        loss = (rho*loss_E) + loss_F
-
-                    else:
-                        loss = torch.nn.MSELoss()(forces_pred, force_labels)
+                    loss = (rho*loss_E) + loss_F
 
                     loss.backward()
                     force_optimizer.step()
-                    running_loss += loss.item()
-                print("Epoch: {}, Total Loss: {}".format(epoch, running_loss))
-                epoch_losses_force.append(running_loss)
+                    
+                    running_loss += loss.detach().item()*train_batch.num_graphs
+                training_losses_force.append(running_loss)
 
-            plt.plot(epoch_losses_force)
+                force_net.eval()
+                val_running_loss = 0
+                for valid_batch in benzene_graphs_val:
+                    
+                    energies_pred, forces_pred = force_net(valid_batch)
+                    
+                    loss_E = torch.nn.L1Loss(reduction='mean')(energies_pred.unsqueeze(-1), valid_batch.y)
+                    loss_F = torch.nn.L1Loss(reduction='sum')(forces_pred, valid_batch.F) / valid_batch.num_graphs
+
+                    loss = (rho*loss_E) + loss_F
+                    
+                    val_running_loss += loss.item()*valid_batch.num_graphs
+                validation_losses_force.append(val_running_loss)
+
+                if (e+1) % report_rate == 0:
+                    print("Epoch {} | Train Loss {:.2e} | Validation Loss {:.2e}".format(e+1, training_losses_force[-1], validation_losses_force[-1]))
+
+            fig = plt.figure(figsize=(5,2))
+            plt.plot(training_losses_force, label="Training Loss")
+            plt.plot(validation_losses_force, label="Validation Loss")
             plt.xlabel('Training Epoch')
-            plt.ylabel('Training Loss (Force Matching)')
+            plt.ylabel('Loss (Force Matching)')
+            plt.legend()
             if savepath is not None:
                 plt.savefig(savepath + "/force_training_loss.png")
                 plt.clf()
@@ -358,24 +423,46 @@ class ToyRunner():
             else:
                 plt.show()
 
-            epoch_losses_score = []
+
+            training_losses_score = []
+            validation_losses_score = []
             for epoch in range(self.n_epochs_score):
+
+                score_net.train()
                 running_loss = 0
-                for i, batch in enumerate(trainloader):
+                for train_batch in benzene_graphs_train:
                     score_optimizer.zero_grad()
 
-                    labels = torch.randint(low=0, high = n_sigmas-1, size = [batch.shape[0]])
-                    loss = anneal_dsm_score_estimation(score_net, batch, labels, sigmas)
+                    labels = torch.randint(low=0, high = n_sigmas-1, size = [len(train_batch)])
+                    loss = anneal_dsm_score_estimation_molecule(score_net, train_batch, labels, sigmas, num_atoms=12)
 
                     loss.backward()
                     score_optimizer.step()
-                    running_loss += loss.item()
-                print("Epoch: {}, Total Loss: {}".format(epoch, running_loss))
-                epoch_losses_score.append(running_loss)
 
-            plt.plot(epoch_losses_score)
+                    running_loss += loss.detach().item()*train_batch.num_graphs
+                training_losses_score.append(running_loss)
+
+                score_net.eval()
+                val_running_loss = 0
+                for valid_batch in benzene_graphs_val:
+
+                    labels = torch.randint(low=0, high = n_sigmas-1, size = [len(valid_batch)])
+                    loss = anneal_dsm_score_estimation_molecule(score_net, valid_batch, labels, sigmas, num_atoms=12)
+
+                    loss.backward()
+
+                    val_running_loss += loss.item()*valid_batch.num_graphs
+                validation_losses_score.append(val_running_loss)
+
+                if (epoch+1) % 5 == 0:
+                    print("Epoch {} | Train Loss {:.2e} | Validation Loss {:.2e}".format(epoch+1, training_losses_score[-1], validation_losses_score[-1]))
+
+            fig = plt.figure(figsize=(5,2))
+            plt.plot(training_losses_score, label="Training Loss")
+            plt.plot(validation_losses_score, label="Validation Loss")
             plt.xlabel('Training Epoch')
-            plt.ylabel('Training Loss (Score Matching)')
+            plt.ylabel('Loss (Score Matching)')
+            plt.legend()
             if savepath is not None:
                 plt.savefig(savepath + "/score_training_loss.png")
                 plt.clf()
@@ -383,27 +470,48 @@ class ToyRunner():
             else:
                 plt.show()
 
-            self.visualize_doublewell(train_x, score_net, force_net, left_bound=-6.5, right_bound=6.5, sigmas=sigmas, force=False, score_and_force=True, savepath=savepath)
+            # self.visualize_doublewell(train_x, score_net, force_net, left_bound=-6.5, right_bound=6.5, sigmas=sigmas, force=False, score_and_force=True, savepath=savepath)
 
         else:
-            epoch_losses_score = []
+            training_losses_score = []
+            validation_losses_score = []
             for epoch in range(self.n_epochs_score):
+
+                score_net.train()
                 running_loss = 0
-                for i, batch in enumerate(trainloader):
+                for train_batch in benzene_graphs_train:
                     score_optimizer.zero_grad()
 
-                    labels = torch.randint(low=0, high = n_sigmas-1, size = [batch.shape[0]])
-                    loss = anneal_dsm_score_estimation(score_net, batch, labels, sigmas)
+                    labels = torch.randint(low=0, high = n_sigmas-1, size = [len(train_batch)])
+                    loss = anneal_dsm_score_estimation_molecule(score_net, train_batch, labels, sigmas, num_atoms=12)
 
                     loss.backward()
                     score_optimizer.step()
-                    running_loss += loss.item()
-                print("Epoch: {}, Total Loss: {}".format(epoch, running_loss))
-                epoch_losses_score.append(running_loss)
 
-            plt.plot(epoch_losses_score)
+                    running_loss += loss.detach().item()*train_batch.num_graphs
+                training_losses_score.append(running_loss)
+
+                score_net.eval()
+                val_running_loss = 0
+                for valid_batch in benzene_graphs_val:
+
+                    labels = torch.randint(low=0, high = n_sigmas-1, size = [len(valid_batch)])
+                    loss = anneal_dsm_score_estimation_molecule(score_net, valid_batch, labels, sigmas, num_atoms=12)
+
+                    loss.backward()
+
+                    val_running_loss += loss.item()*valid_batch.num_graphs
+                validation_losses_score.append(val_running_loss)
+
+                if (epoch+1) % 5 == 0:
+                    print("Epoch {} | Train Loss {:.2e} | Validation Loss {:.2e}".format(epoch+1, training_losses_score[-1], validation_losses_score[-1]))
+
+            fig = plt.figure(figsize=(5,2))
+            plt.plot(training_losses_score, label="Training Loss")
+            plt.plot(validation_losses_score, label="Validation Loss")
             plt.xlabel('Training Epoch')
-            plt.ylabel('Training Loss (Score Matching)')
+            plt.ylabel('Loss (Score Matching)')
+            plt.legend()
             if savepath is not None:
                 plt.savefig(savepath + "/score_training_loss.png")
                 plt.clf()
@@ -411,76 +519,7 @@ class ToyRunner():
             else:
                 plt.show()
 
-            self.visualize_doublewell(train_x, score_net, None, left_bound=-6.5, right_bound=6.5, sigmas=sigmas, force=False, savepath=savepath)
-
-
-    def doublewell_md_true(self, device=None, num_samples=1000):
-
-        if not os.path.exists("results/toy_true_forces"):
-            os.mkdir("results/toy_true_forces")
-
-        # Set up double well
-        dim=2
-        target = DoubleWellEnergy(dim, c=0.5)
-        self.energy = target
-
-        left_bound=-2.75
-        right_bound=2.75
-
-        init_positions = torch.rand(10000, 2) * (right_bound - left_bound) + left_bound
-
-        print("!", type(init_positions))
-        self.plot_energy(self.energy, extent=(left_bound, right_bound))
-        plt.scatter(init_positions[:, 0], init_positions[:, 1], s=0.1)
-        plt.title("Sampled Data")
-        plt.xlim([left_bound, right_bound])
-        plt.ylim([left_bound, right_bound])
-        plt.savefig("results/toy_true_forces/iter0.png")
-        plt.clf()
-        plt.close()
-
-        grid_size = 20
-        mesh = []
-        x = np.linspace(left_bound, right_bound, grid_size)
-        y = np.linspace(left_bound, right_bound, grid_size)
-        for i in x:
-            for j in y:
-                mesh.append(np.asarray([i, j]))
-
-        mesh = np.stack(mesh, axis=0)
-        mesh = torch.from_numpy(mesh).float()
-        if device is not None:
-            mesh = mesh.to(device)
-
-        forces = target.force(mesh.detach())
-        mesh = mesh.detach().numpy()
-        forces = forces.detach().numpy()
-
-        plt.grid(False)
-        plt.axis('off')
-        plt.quiver(mesh[:, 0], mesh[:, 1], forces[:, 0], forces[:, 1], width=0.005)
-        plt.scatter(init_positions[:, 0], init_positions[:, 1], s=0.1)
-        plt.title('True Forces', fontsize=16)
-        plt.axis('square')
-        x = np.linspace(left_bound, right_bound, grid_size)
-        y = np.linspace(left_bound, right_bound, grid_size)
-        plt.show()
-
-        masses = torch.ones(init_positions.shape[0]) * 1
-        dynamics_driver = PhysicalLangevinDynamicsMonoatomic(init_positions=init_positions, masses=masses, dt=0.1, temperature=293)
-        for i in range(1,500+1):
-            dynamics_driver.true_step(target)
-
-            final_positions = dynamics_driver.positions.detach().numpy()
-
-            plt.scatter(final_positions[:, 0], final_positions[:, 1], s=0.1)
-            # plt.axis('square')
-            plt.title('Generated Data')
-            plt.xlim([left_bound, right_bound])
-            plt.ylim([left_bound, right_bound])
-            plt.savefig("results/toy_true_forces/iter{:03d}.png".format(i))
-            plt.clf()
-            plt.close()
+            # self.visualize_doublewell(train_x, score_net, None, left_bound=-6.5, right_bound=6.5, sigmas=sigmas, force=False, savepath=savepath)
 
 
 

@@ -7,6 +7,8 @@ by __Yang Song__ and __Stefano Ermon__. Stanford AI Lab.
 
 ## Dependencies
 
+* PyTorch Geometric
+
 * bgflow
 
 * PyTorch
