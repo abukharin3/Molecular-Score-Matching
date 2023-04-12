@@ -169,3 +169,4 @@ def anneal_sliced_score_estimation_vr(scorenet, samples, labels, sigmas, n_parti
     loss = (loss1 + loss2) * (used_sigmas.squeeze() ** 2)
 
     return loss.mean(dim=0)
+    

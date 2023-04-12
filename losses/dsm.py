@@ -41,7 +41,9 @@ def anneal_dsm_score_estimation(scorenet, samples, labels, sigmas, anneal_power=
 
 def anneal_dsm_score_estimation_molecule(scorenet, data_batch, labels, sigmas, num_atoms, anneal_power=2.):
     used_sigmas = sigmas[labels].view(len(data_batch), 1)
+    # used_sigmas = torch.ones_like(used_sigmas)
     perturbed_positions = (data_batch.pos + torch.randn_like(data_batch.pos)).view(len(data_batch), num_atoms, 3) * used_sigmas.unsqueeze(-1).expand(len(data_batch), num_atoms, 3)
+    # perturbed_positions = (data_batch.pos + torch.ones_like(data_batch.pos)).view(len(data_batch), num_atoms, 3) * used_sigmas.unsqueeze(-1).expand(len(data_batch), num_atoms, 3)
 
     data_batch_dict = dict(list(data_batch))
     pert_batch = Batch(x=data_batch_dict['x'],
